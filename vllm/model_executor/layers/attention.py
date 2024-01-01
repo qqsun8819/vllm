@@ -3,7 +3,6 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
                                          LowerTriangularMaskWithTensorBias)
 
@@ -142,16 +141,88 @@ class PagedAttention(nn.Module):
                 query = query.unflatten(0, (batch_size, seq_len))
                 key = key.unflatten(0, (batch_size, seq_len))
                 value = value.unflatten(0, (batch_size, seq_len))
+            
+            # convert input format
+            assert query.ndim in [4, 5]
+            batch = query.shape[0]
+            seqlen_q = query.shape[1]
+            seqlen_kv = key.shape[1]
+            head_dim_q = query.shape[-1]
+            head_dim_v = value.shape[-1]
 
-            out = xops.memory_efficient_attention_forward(
+            attn_bias = input_metadata.attn_bias
+            attn_bias.k_seqinfo.seqstart = attn_bias.k_seqinfo.seqstart.to(query.device, non_blocking=True)
+            attn_bias.q_seqinfo.seqstart = attn_bias.q_seqinfo.seqstart.to(query.device, non_blocking=True)
+
+            cu_seqlen_k = attn_bias.k_seqinfo.seqstart
+            cu_seqlen_q = attn_bias.q_seqinfo.seqstart
+            max_seqlen_q = attn_bias.q_seqinfo.max_seqlen
+            max_seqlen_k = attn_bias.k_seqinfo.max_seqlen
+            seqused_k = None
+            if query.ndim == 5:  # QGA
+
+                def fold(x):
+                    if x.stride(3) == 0:
+                        return x[:, :, :, 0]
+                    return x.reshape(
+                        [
+                        x.shape[0],
+                        x.shape[1],
+                        -1,
+                        x.shape[4],
+                        ]
+                        )
+
+                query = fold(query)
+                key = fold(key)
+                value = fold(value)
+            # Optimize for MHA
+            if key.ndim == 4 and key.stride(2) == 0 and value.stride(2) == 0 :
+                key = key[:, :, :1]
+                value = value[:, :, :1]
+            # Initially we have `query.shape = [batch, seqlen, num_heads, head_dim_q]`
+            # We want format `[batch * seqlen, num_heads, head_dim_q]`
+            if cu_seqlen_k is not None:
+                query = query.reshape([batch * seqlen_q, -1, head_dim_q])
+                key = key.reshape([batch * seqlen_kv, -1, head_dim_q])
+                value = value.reshape([batch * seqlen_kv, -1, head_dim_v])
+
+            return_softmax = False
+            out_shape = [
+                *query.shape[:-1],
+                value.shape[-1],
+            ]
+            win_left = -1
+            win_right = -1
+            from flash_attn.flash_attn_interface import flash_attn_cuda as _C_flashattention         
+            out = query.new_empty(query.shape[0], query.shape[1], value.shape[2])
+            (
+                out,
+                q_padded,
+                k_padded,
+                v_padded,
+                out_padded,
+                softmax_lse,
+                p,
+                rng_state,
+            ) = _C_flashattention.varlen_fwd(
                 query,
                 key,
                 value,
-                attn_bias=input_metadata.attn_bias,
-                p=0.0,
-                scale=self.scale,
-                op=xops.fmha.MemoryEfficientAttentionFlashAttentionOp[0] if
-                (is_hip()) else None,
+                out,
+                cu_seqlen_q,
+                cu_seqlen_k,
+                seqused_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                0.0, # p
+                query.shape[-1] ** (-0.5), #softmax_scale/scale_float
+                False,
+                True,# is_casual
+                win_left,
+                win_right,
+                return_softmax,
+                None,
             )
             output = out.view_as(query)
         else:
